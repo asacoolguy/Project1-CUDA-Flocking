@@ -37,13 +37,13 @@ void checkCUDAError(const char *msg, int line = -1) {
 *****************/
 
 /*! Block size used for CUDA kernel launch. */
-#define blockSize 128
+#define blockSize 1024
 
 // LOOK-1.2 Parameters for the boids algorithm.
 // These worked well in our reference implementation.
-#define rule1Distance 3.0f
-#define rule2Distance 1.0f
-#define rule3Distance 3.0f
+#define rule1Distance 5.0f
+#define rule2Distance 3.0f
+#define rule3Distance 5.0f
 
 #define rule1Scale 0.01f
 #define rule2Scale 0.1f
@@ -52,7 +52,7 @@ void checkCUDAError(const char *msg, int line = -1) {
 #define maxSpeed 1.0f
 
 /*! Size of the starting area in simulation space. */
-#define scene_scale 40.0f
+#define scene_scale 100.0f
 
 /***********************************************
 * Kernel state (pointers are device pointers) *
@@ -158,7 +158,7 @@ void Boids::initSimulation(int N) {
   checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
 
   // LOOK-2.1 computing grid params
-  gridCellWidth = 2.0f * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
+  gridCellWidth = 2.0 * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
   int halfSideCount = (int)(scene_scale / gridCellWidth) + 1;
   gridSideCount = 2 * halfSideCount;
 
