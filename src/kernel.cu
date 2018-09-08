@@ -41,9 +41,9 @@ void checkCUDAError(const char *msg, int line = -1) {
 
 // LOOK-1.2 Parameters for the boids algorithm.
 // These worked well in our reference implementation.
-#define rule1Distance 50.0f
-#define rule2Distance 30.0f
-#define rule3Distance 50.0f
+#define rule1Distance 5.0f
+#define rule2Distance 3.0f
+#define rule3Distance 5.0f
 
 #define rule1Scale 0.01f
 #define rule2Scale 0.1f
@@ -52,7 +52,7 @@ void checkCUDAError(const char *msg, int line = -1) {
 #define maxSpeed 1.0f
 
 /*! Size of the starting area in simulation space. */
-#define scene_scale 5.0f
+#define scene_scale 50.0f
 
 /***********************************************
 * Kernel state (pointers are device pointers) *
@@ -433,7 +433,6 @@ __global__ void kernUpdateVelNeighborSearchScattered(
 		int y = (int)((myPos.y - gridMin.y) * inverseCellWidth);
 		int z = (int)((myPos.z - gridMin.z) * inverseCellWidth);
 		int myCellIndex = gridIndex3Dto1D(x, y, z, gridResolution);
-		printf("index %d, pos is %f, %f, %f and cellIndex is %d\n", index, myPos.x, myPos.y, myPos.z, myCellIndex);
 
 		// - Identify which cells (including this cell) may contain neighbors. This isn't always 9. 
 		int cellsToCheck[9];
@@ -463,7 +462,6 @@ __global__ void kernUpdateVelNeighborSearchScattered(
 			if (currentCell == -1) continue;
 			int startIndex = gridCellStartIndices[currentCell];
 			int endIndex = gridCellEndIndices[currentCell];
-			printf("     reading neighbor %d which starts at %d and ends at %d\n", currentCell, startIndex, endIndex);
 
 			// - Access each boid in the cell and compute velocity change from the boids rules, if this boid is within the neighborhood distance.
 			for (int j = startIndex; j <= endIndex; j++) {
@@ -508,7 +506,6 @@ __global__ void kernUpdateVelNeighborSearchScattered(
 		}
 
 		vel2[index] = newVel;
-		printf("new velocity for index $d is $f, $f, $f\n", index, newVel.x, newVel.y, newVel.z);
 	}
 }
 
@@ -559,7 +556,7 @@ void Boids::stepSimulationScatteredGrid(float dt) {
 	kernComputeIndices << < fullBlocksPerGrid, blockSize >> > (numObjects, gridSideCount,
 		gridMinimum, gridInverseCellWidth, dev_pos, dev_particleArrayIndices, dev_particleGridIndices);
 
-	std::unique_ptr<int[]>gridIndices{ new int[numObjects] };
+	/*std::unique_ptr<int[]>gridIndices{ new int[numObjects] };
 	std::unique_ptr<int[]>arrayIndices{ new int[numObjects] };
 	cudaMemcpy(gridIndices.get(), dev_particleGridIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
 	cudaMemcpy(arrayIndices.get(), dev_particleArrayIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
@@ -568,21 +565,21 @@ void Boids::stepSimulationScatteredGrid(float dt) {
 	for (int i = 0; i < numObjects; i++) {
 		std::cout << "  gridIndices: " << gridIndices[i];
 		std::cout << "  arrayIndices: " << arrayIndices[i] << std::endl;
-	}
+	}*/
 
 	// - Unstable key sort using Thrust. A stable sort isn't necessary, but you are welcome to do a performance comparison.
 	dev_thrust_particleGridIndices = thrust::device_ptr<int>(dev_particleGridIndices);
 	dev_thrust_particleArrayIndices = thrust::device_ptr<int>(dev_particleArrayIndices);
 	thrust::sort_by_key(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects, dev_thrust_particleArrayIndices);
 
-	cudaMemcpy(gridIndices.get(), dev_particleGridIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
+	/*cudaMemcpy(gridIndices.get(), dev_particleGridIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
 	cudaMemcpy(arrayIndices.get(), dev_particleArrayIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
 	checkCUDAErrorWithLine("memcpy back failed!");
 	std::cout << "after sort: " << std::endl;
 	for (int i = 0; i < numObjects; i++) {
 		std::cout << "  gridIndices: " << gridIndices[i];
 		std::cout << "  arrayIndices: " << arrayIndices[i] << std::endl;
-	}
+	}*/
 
 	// - Naively unroll the loop for finding the start and end indices of each cell's data pointers in the array of boid indices
 	kernResetIntBuffer << < fullBlocksPerGrid, blockSize >> > (gridCellCount, dev_gridCellStartIndices, -1);
@@ -590,7 +587,7 @@ void Boids::stepSimulationScatteredGrid(float dt) {
 	kernIdentifyCellStartEnd << < fullBlocksPerGrid, blockSize >> > (numObjects, dev_particleGridIndices,
 		dev_gridCellStartIndices, dev_gridCellEndIndices);
 
-	std::unique_ptr<int[]>starts{ new int[gridCellCount] };
+	/*std::unique_ptr<int[]>starts{ new int[gridCellCount] };
 	std::unique_ptr<int[]>ends{ new int[gridCellCount] };
 	cudaMemcpy(starts.get(), dev_gridCellStartIndices, sizeof(int) * gridCellCount, cudaMemcpyDeviceToHost);
 	cudaMemcpy(ends.get(), dev_gridCellEndIndices, sizeof(int) * gridCellCount, cudaMemcpyDeviceToHost);
@@ -598,20 +595,20 @@ void Boids::stepSimulationScatteredGrid(float dt) {
 	std::cout << "after identify startEnd: " << std::endl;
 	for (int i = 0; i < gridCellCount; i++) {
 		std::cout << " cell " << i << "starts at " << starts[i] << " and ends at " << ends[i] << std::endl;
-	}
+	}*/
 	  
 	// - Perform velocity updates using neighbor search
-	kernUpdateVelNeighborSearchScattered << < fullBlocksPerGrid, blockSize >> > (numObjects, gridCellCount,
+	kernUpdateVelNeighborSearchScattered << < fullBlocksPerGrid, blockSize >> > (numObjects, gridSideCount,
 		gridMinimum, gridInverseCellWidth, gridCellWidth, dev_gridCellStartIndices, dev_gridCellEndIndices,
 		dev_particleArrayIndices, dev_pos, dev_vel1, dev_vel2);
 	  
-	std::unique_ptr<int[]>speeds{ new int[numObjects] };
+	/*std::unique_ptr<int[]>speeds{ new int[numObjects] };
 	cudaMemcpy(speeds.get(), dev_vel2, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
 	checkCUDAErrorWithLine("memcpy back failed!");
 	std::cout << "right after updateVel: " << std::endl;
 	for (int i = 0; i < numObjects; i++) {
 		std::cout << "  vel2: " << speeds[i] << std::endl;
-	}
+	}*/
 
 
 	// - Update positions
