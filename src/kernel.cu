@@ -41,9 +41,9 @@ void checkCUDAError(const char *msg, int line = -1) {
 
 // LOOK-1.2 Parameters for the boids algorithm.
 // These worked well in our reference implementation.
-#define rule1Distance 5.0f
-#define rule2Distance 3.0f
-#define rule3Distance 5.0f
+#define rule1Distance 50.0f
+#define rule2Distance 30.0f
+#define rule3Distance 50.0f
 
 #define rule1Scale 0.01f
 #define rule2Scale 0.1f
@@ -52,7 +52,7 @@ void checkCUDAError(const char *msg, int line = -1) {
 #define maxSpeed 1.0f
 
 /*! Size of the starting area in simulation space. */
-#define scene_scale 100.0f
+#define scene_scale 5.0f
 
 /***********************************************
 * Kernel state (pointers are device pointers) *
@@ -169,6 +169,21 @@ void Boids::initSimulation(int N) {
   gridMinimum.z -= halfGridWidth;
 
   // TODO-2.1 TODO-2.3 - Allocate additional buffers here.
+  cudaMalloc((void**)&dev_particleArrayIndices, N * sizeof(int));
+  checkCUDAErrorWithLine("cudaMalloc dev_particleArrayIndices failed!");
+
+  cudaMalloc((void**)&dev_particleGridIndices, N * sizeof(int));
+  checkCUDAErrorWithLine("cudaMalloc dev_particleGridIndices failed!");
+
+  cudaMalloc((void**)&dev_gridCellStartIndices, gridCellCount * sizeof(int));
+  checkCUDAErrorWithLine("cudaMalloc dev_gridCellStartIndices failed!");
+
+  cudaMalloc((void**)&dev_gridCellEndIndices, gridCellCount * sizeof(int));
+  checkCUDAErrorWithLine("cudaMalloc dev_gridCellEndIndices failed!");
+
+  /*dev_thrust_particleGridIndices = thrust::device_ptr<int>(dev_particleGridIndices);
+  dev_thrust_particleArrayIndices = thrust::device_ptr<int>(dev_particleArrayIndices);*/
+
   cudaDeviceSynchronize();
 }
 
@@ -306,7 +321,7 @@ __global__ void kernUpdateVelocityBruteForce(int N, glm::vec3 *pos,
 /**
 *	Updates vel2 into vel1
 */
-__global__ void kernPingPongVelocityBruteForce(int N, glm::vec3 *vel1, glm::vec3 *vel2) {
+__global__ void kernPingPongVelocity(int N, glm::vec3 *vel1, glm::vec3 *vel2) {
 	int index = (blockIdx.x * blockDim.x) + threadIdx.x;
 	if (index < N) {
 		vel1[index] = vel2[index];
@@ -345,16 +360,27 @@ __global__ void kernUpdatePos(int N, float dt, glm::vec3 *pos, glm::vec3 *vel) {
 //            for(y)
 //             for(z)? Or some other order?
 __device__ int gridIndex3Dto1D(int x, int y, int z, int gridResolution) {
-  return x + y * gridResolution + z * gridResolution * gridResolution;
+	return x + y * gridResolution + z * gridResolution * gridResolution;;
 }
 
 __global__ void kernComputeIndices(int N, int gridResolution,
   glm::vec3 gridMin, float inverseCellWidth,
   glm::vec3 *pos, int *indices, int *gridIndices) {
     // TODO-2.1
-    // - Label each boid with the index of its grid cell.
-    // - Set up a parallel array of integer indices as pointers to the actual
-    //   boid data in pos and vel1/vel2
+    int index = (blockIdx.x * blockDim.x) + threadIdx.x;
+	if (index < N) {
+		// - Label each boid with the index of its grid cell.
+		int x = (int)((pos[index].x - gridMin.x) * inverseCellWidth);
+		int y = (int)((pos[index].y - gridMin.y) * inverseCellWidth);
+		int z = (int)((pos[index].z - gridMin.z) * inverseCellWidth);
+		int gridIndex = gridIndex3Dto1D(x, y, z, gridResolution);
+		//printf("input is %f, %f, %f, invW is %f, xyz is %d, %d, %d, output is %d\n", pos[index].x, pos[index].y, pos[index].z, inverseCellWidth, x, y, z, gridIndex);
+		gridIndices[index] = gridIndex;
+
+		// - Set up a parallel array of integer indices as pointers to the actual
+		//   boid data in pos and vel1/vel2
+		indices[index] = index;
+	}
 }
 
 // LOOK-2.1 Consider how this could be useful for indicating that a cell
@@ -368,26 +394,122 @@ __global__ void kernResetIntBuffer(int N, int *intBuffer, int value) {
 
 __global__ void kernIdentifyCellStartEnd(int N, int *particleGridIndices,
   int *gridCellStartIndices, int *gridCellEndIndices) {
-  // TODO-2.1
-  // Identify the start point of each cell in the gridIndices array.
-  // This is basically a parallel unrolling of a loop that goes
-  // "this index doesn't match the one before it, must be a new cell!"
+	// TODO-2.1
+	// Identify the start point of each cell in the gridIndices array.
+	// This is basically a parallel unrolling of a loop that goes
+	// "this index doesn't match the one before it, must be a new cell!"
+	int index = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (index < N) {
+		int gridIndex = particleGridIndices[index];
+
+		if (index == 0 || gridIndex != particleGridIndices[index - 1]) {
+			gridCellStartIndices[gridIndex] = index;
+			if (gridCellEndIndices[gridIndex] == -1) {
+				gridCellEndIndices[gridIndex] = index;
+			}
+		}
+		else if (gridIndex == particleGridIndices[index - 1]) {
+			gridCellEndIndices[gridIndex] = imax(index, gridCellEndIndices[gridIndex]);
+		}
+	}
 }
 
 __global__ void kernUpdateVelNeighborSearchScattered(
   int N, int gridResolution, glm::vec3 gridMin,
   float inverseCellWidth, float cellWidth,
-  int *gridCellStartIndices, int *gridCellEndIndices,
-  int *particleArrayIndices,
+  const int *gridCellStartIndices, const int *gridCellEndIndices,
+  const int *particleArrayIndices,
   glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 *vel2) {
-  // TODO-2.1 - Update a boid's velocity using the uniform grid to reduce
-  // the number of boids that need to be checked.
-  // - Identify the grid cell that this particle is in
-  // - Identify which cells may contain neighbors. This isn't always 8.
-  // - For each cell, read the start/end indices in the boid pointer array.
-  // - Access each boid in the cell and compute velocity change from
-  //   the boids rules, if this boid is within the neighborhood distance.
-  // - Clamp the speed change before putting the new speed in vel2
+	int index = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (index < N) {
+		// TODO-2.1 - Update a boid's velocity using the uniform grid to reduce the number of boids that need to be checked.
+		// - Identify the grid cell that this particle is in
+		glm::vec3 myPos = pos[index];
+		glm::vec3 myVel = vel1[index];
+		glm::vec3 newVel(0.0f, 0.0f, 0.0f);
+		int x = (int)((myPos.x - gridMin.x) * inverseCellWidth);
+		int y = (int)((myPos.y - gridMin.y) * inverseCellWidth);
+		int z = (int)((myPos.z - gridMin.z) * inverseCellWidth);
+		int myCellIndex = gridIndex3Dto1D(x, y, z, gridResolution);
+		printf("index %d, pos is %f, %f, %f and cellIndex is %d\n", index, myPos.x, myPos.y, myPos.z, myCellIndex);
+
+		// - Identify which cells (including this cell) may contain neighbors. This isn't always 9. 
+		int cellsToCheck[9];
+		for (int i = 0; i < 9; i++) {
+			cellsToCheck[i] = -1;
+		}
+
+		cellsToCheck[0] = myCellIndex;
+		int neighborSize = 1;
+		if (x > 0) cellsToCheck[neighborSize++] = gridIndex3Dto1D(x - 1, y, z, gridResolution);
+		if (x < gridResolution - 1) cellsToCheck[neighborSize++] = gridIndex3Dto1D(x + 1, y, z, gridResolution);
+		if (y > 0) cellsToCheck[neighborSize++] = gridIndex3Dto1D(x, y - 1, z, gridResolution);
+		if (y < gridResolution - 1) cellsToCheck[neighborSize++] = gridIndex3Dto1D(x, y + 1, z, gridResolution);
+		if (z > 0) cellsToCheck[neighborSize++] = gridIndex3Dto1D(x, y, z - 1, gridResolution);
+		if (z < gridResolution - 1) cellsToCheck[neighborSize++] = gridIndex3Dto1D(x, y, z + 1, gridResolution);
+
+		// set up variables
+		glm::vec3 center(0.0f, 0.0f, 0.0f);     // rule 1
+		int centerNeighbors = 0;
+		glm::vec3 separation(0.0f, 0.0f, 0.0f); // rule 2
+		glm::vec3 cohesion(0.0f, 0.0f, 0.0f);   // rule 3
+		int cohesionNeighbors = 0;
+
+		for (int i = 0; i < neighborSize; i++) {
+			// - For each cell, read the start/end indices in the boid pointer array.
+			int currentCell = cellsToCheck[i];
+			if (currentCell == -1) continue;
+			int startIndex = gridCellStartIndices[currentCell];
+			int endIndex = gridCellEndIndices[currentCell];
+			printf("     reading neighbor %d which starts at %d and ends at %d\n", currentCell, startIndex, endIndex);
+
+			// - Access each boid in the cell and compute velocity change from the boids rules, if this boid is within the neighborhood distance.
+			for (int j = startIndex; j <= endIndex; j++) {
+				if (j == -1) continue;
+				int otherIndex = particleArrayIndices[j];
+				if (otherIndex != -1 && otherIndex != index ) {
+					glm::vec3 otherPos = pos[otherIndex];
+					glm::vec3 otherVel = vel1[otherIndex];
+
+					float distance = glm::length(myPos - otherPos);
+
+					if (distance < rule1Distance) {
+						center += otherPos;
+						centerNeighbors++;
+					}
+					if (distance < rule2Distance) {
+						separation -= (otherPos - myPos);
+					}
+					if (distance < rule3Distance) {
+						cohesion += otherVel;
+						cohesionNeighbors++;
+					}
+				}
+
+				if (centerNeighbors > 0) {
+					center /= centerNeighbors;
+					newVel += (center - myPos) * rule1Scale;
+				}
+				if (cohesionNeighbors > 0) {
+					cohesion /= cohesionNeighbors;
+					newVel += cohesion * rule3Scale;
+				}
+
+				newVel += separation * rule2Scale;
+			}
+		}
+
+		// - Clamp the speed change before putting the new speed in vel2
+		float speed = glm::length(newVel);
+		if (speed > maxSpeed) {
+			newVel = glm::normalize(newVel) * maxSpeed;
+		}
+
+		vel2[index] = newVel;
+		printf("new velocity for index $d is $f, $f, $f\n", index, newVel.x, newVel.y, newVel.z);
+	}
 }
 
 __global__ void kernUpdateVelNeighborSearchCoherent(
@@ -424,24 +546,81 @@ void Boids::stepSimulationNaive(float dt) {
 	checkCUDAErrorWithLine("kernUpdateVelocityBruteForce failed!");
 
 	// TODO-1.2 ping-pong the velocity buffers
-	kernPingPongVelocityBruteForce << <fullBlocksPerGrid, blockSize >> > (numObjects, dev_vel1, dev_vel2);
-	checkCUDAErrorWithLine("kernPingPongVelocityBruteForce failed!");
+	kernPingPongVelocity << <fullBlocksPerGrid, blockSize >> > (numObjects, dev_vel1, dev_vel2);
+	checkCUDAErrorWithLine("kernPingPongVelocity failed!");
 
 }
 
 void Boids::stepSimulationScatteredGrid(float dt) {
-  // TODO-2.1
-  // Uniform Grid Neighbor search using Thrust sort.
-  // In Parallel:
-  // - label each particle with its array index as well as its grid index.
-  //   Use 2x width grids.
-  // - Unstable key sort using Thrust. A stable sort isn't necessary, but you
-  //   are welcome to do a performance comparison.
-  // - Naively unroll the loop for finding the start and end indices of each
-  //   cell's data pointers in the array of boid indices
-  // - Perform velocity updates using neighbor search
-  // - Update positions
-  // - Ping-pong buffers as needed
+	dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
+	
+	// TODO-2.1: Uniform Grid Neighbor search using Thrust sort in Parallel:
+	// - label each particle with its array index as well as its grid index. Use 2x width grids.
+	kernComputeIndices << < fullBlocksPerGrid, blockSize >> > (numObjects, gridSideCount,
+		gridMinimum, gridInverseCellWidth, dev_pos, dev_particleArrayIndices, dev_particleGridIndices);
+
+	std::unique_ptr<int[]>gridIndices{ new int[numObjects] };
+	std::unique_ptr<int[]>arrayIndices{ new int[numObjects] };
+	cudaMemcpy(gridIndices.get(), dev_particleGridIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
+	cudaMemcpy(arrayIndices.get(), dev_particleArrayIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
+	checkCUDAErrorWithLine("memcpy back failed!");
+	std::cout << "right before sort: " << std::endl;
+	for (int i = 0; i < numObjects; i++) {
+		std::cout << "  gridIndices: " << gridIndices[i];
+		std::cout << "  arrayIndices: " << arrayIndices[i] << std::endl;
+	}
+
+	// - Unstable key sort using Thrust. A stable sort isn't necessary, but you are welcome to do a performance comparison.
+	dev_thrust_particleGridIndices = thrust::device_ptr<int>(dev_particleGridIndices);
+	dev_thrust_particleArrayIndices = thrust::device_ptr<int>(dev_particleArrayIndices);
+	thrust::sort_by_key(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects, dev_thrust_particleArrayIndices);
+
+	cudaMemcpy(gridIndices.get(), dev_particleGridIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
+	cudaMemcpy(arrayIndices.get(), dev_particleArrayIndices, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
+	checkCUDAErrorWithLine("memcpy back failed!");
+	std::cout << "after sort: " << std::endl;
+	for (int i = 0; i < numObjects; i++) {
+		std::cout << "  gridIndices: " << gridIndices[i];
+		std::cout << "  arrayIndices: " << arrayIndices[i] << std::endl;
+	}
+
+	// - Naively unroll the loop for finding the start and end indices of each cell's data pointers in the array of boid indices
+	kernResetIntBuffer << < fullBlocksPerGrid, blockSize >> > (gridCellCount, dev_gridCellStartIndices, -1);
+	kernResetIntBuffer << < fullBlocksPerGrid, blockSize >> > (gridCellCount, dev_gridCellEndIndices, -1);
+	kernIdentifyCellStartEnd << < fullBlocksPerGrid, blockSize >> > (numObjects, dev_particleGridIndices,
+		dev_gridCellStartIndices, dev_gridCellEndIndices);
+
+	std::unique_ptr<int[]>starts{ new int[gridCellCount] };
+	std::unique_ptr<int[]>ends{ new int[gridCellCount] };
+	cudaMemcpy(starts.get(), dev_gridCellStartIndices, sizeof(int) * gridCellCount, cudaMemcpyDeviceToHost);
+	cudaMemcpy(ends.get(), dev_gridCellEndIndices, sizeof(int) * gridCellCount, cudaMemcpyDeviceToHost);
+	checkCUDAErrorWithLine("memcpy back failed!");
+	std::cout << "after identify startEnd: " << std::endl;
+	for (int i = 0; i < gridCellCount; i++) {
+		std::cout << " cell " << i << "starts at " << starts[i] << " and ends at " << ends[i] << std::endl;
+	}
+	  
+	// - Perform velocity updates using neighbor search
+	kernUpdateVelNeighborSearchScattered << < fullBlocksPerGrid, blockSize >> > (numObjects, gridCellCount,
+		gridMinimum, gridInverseCellWidth, gridCellWidth, dev_gridCellStartIndices, dev_gridCellEndIndices,
+		dev_particleArrayIndices, dev_pos, dev_vel1, dev_vel2);
+	  
+	std::unique_ptr<int[]>speeds{ new int[numObjects] };
+	cudaMemcpy(speeds.get(), dev_vel2, sizeof(int) * numObjects, cudaMemcpyDeviceToHost);
+	checkCUDAErrorWithLine("memcpy back failed!");
+	std::cout << "right after updateVel: " << std::endl;
+	for (int i = 0; i < numObjects; i++) {
+		std::cout << "  vel2: " << speeds[i] << std::endl;
+	}
+
+
+	// - Update positions
+	kernUpdatePos << < fullBlocksPerGrid, blockSize >> > (numObjects, dt, dev_pos, dev_vel1);
+	checkCUDAErrorWithLine("kernUpdatePos failed!");
+	
+	// - Ping-pong buffers as needed
+	kernPingPongVelocity << < fullBlocksPerGrid, blockSize >> > (numObjects, dev_vel1, dev_vel2);
+	checkCUDAErrorWithLine("kernPingPongVelocity failed!");
 }
 
 void Boids::stepSimulationCoherentGrid(float dt) {
@@ -468,68 +647,79 @@ void Boids::endSimulation() {
   cudaFree(dev_pos);
 
   // TODO-2.1 TODO-2.3 - Free any additional buffers here.
+  cudaFree(dev_particleArrayIndices);
+  cudaFree(dev_particleGridIndices);
+  cudaFree(dev_gridCellStartIndices);
+  cudaFree(dev_gridCellEndIndices);
 }
 
 void Boids::unitTest() {
   // LOOK-1.2 Feel free to write additional tests here.
 
   // test unstable sort
-  int *dev_intKeys;
-  int *dev_intValues;
-  int N = 10;
+  glm::vec3 *dev_testPos;
+  int *dev_testGrid;
+  int *dev_testArray;
+  int N = 4;
+  float width = 1;
+  float invWidth = 1.0f / width;
+  int resolution = 3;
+  int cellCount = resolution * resolution * resolution;
 
-  std::unique_ptr<int[]>intKeys{ new int[N] };
-  std::unique_ptr<int[]>intValues{ new int[N] };
+  std::unique_ptr<glm::vec3[]>testPos{ new glm::vec3[N] };
+  std::unique_ptr<int[]>testGrid{ new int[cellCount] };
+  std::unique_ptr<int[]>testArray{ new int[cellCount] };
+   
 
-  intKeys[0] = 0; intValues[0] = 0;
-  intKeys[1] = 1; intValues[1] = 1;
-  intKeys[2] = 0; intValues[2] = 2;
-  intKeys[3] = 3; intValues[3] = 3;
-  intKeys[4] = 0; intValues[4] = 4;
-  intKeys[5] = 2; intValues[5] = 5;
-  intKeys[6] = 2; intValues[6] = 6;
-  intKeys[7] = 0; intValues[7] = 7;
-  intKeys[8] = 5; intValues[8] = 8;
-  intKeys[9] = 6; intValues[9] = 9;
+  testPos[0] = glm::vec3(0, 0.2f, 1.2f);
+  testPos[1] = glm::vec3(0, 1.1f, 2.2f);
+  testPos[2] = glm::vec3(2.5f, 0.1f, 0);
+  testPos[3] = glm::vec3(2.5f, 2.5f, 2.5f);
 
-  cudaMalloc((void**)&dev_intKeys, N * sizeof(int));
+
+  cudaMalloc((void**)&dev_testPos, N * sizeof(glm::vec3));
   checkCUDAErrorWithLine("cudaMalloc dev_intKeys failed!");
 
-  cudaMalloc((void**)&dev_intValues, N * sizeof(int));
+  cudaMalloc((void**)&dev_testGrid, cellCount * sizeof(int));
+  checkCUDAErrorWithLine("cudaMalloc dev_intValues failed!");
+
+  cudaMalloc((void**)&dev_testArray, cellCount * sizeof(int));
   checkCUDAErrorWithLine("cudaMalloc dev_intValues failed!");
 
   dim3 fullBlocksPerGrid((N + blockSize - 1) / blockSize);
 
-  std::cout << "before unstable sort: " << std::endl;
-  for (int i = 0; i < N; i++) {
-    std::cout << "  key: " << intKeys[i];
-    std::cout << " value: " << intValues[i] << std::endl;
+  std::cout << "before compute indeces " << std::endl;
+  for (int i = 0; i < cellCount; i++) {
+	  testGrid[i] = 0;
+	  testArray[i] = 0;
+
+    std::cout << "  gridIndex: " << testGrid[i];
+    std::cout << "    arrayIndex: " << testArray[i] << std::endl;
   }
 
   // How to copy data to the GPU
-  cudaMemcpy(dev_intKeys, intKeys.get(), sizeof(int) * N, cudaMemcpyHostToDevice);
-  cudaMemcpy(dev_intValues, intValues.get(), sizeof(int) * N, cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_testPos, testPos.get(), sizeof(glm::vec3) * N, cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_testGrid, testGrid.get(), sizeof(int) * cellCount, cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_testArray, testArray.get(), sizeof(int) * cellCount, cudaMemcpyHostToDevice);
 
-  // Wrap device vectors in thrust iterators for use with thrust.
-  thrust::device_ptr<int> dev_thrust_keys(dev_intKeys);
-  thrust::device_ptr<int> dev_thrust_values(dev_intValues);
-  // LOOK-2.1 Example for using thrust::sort_by_key
-  thrust::sort_by_key(dev_thrust_keys, dev_thrust_keys + N, dev_thrust_values);
+  kernComputeIndices << < fullBlocksPerGrid, blockSize >> > (N, resolution,
+	  glm::vec3(0,0,0), invWidth, dev_testPos, dev_testArray, dev_testGrid);
 
   // How to copy data back to the CPU side from the GPU
-  cudaMemcpy(intKeys.get(), dev_intKeys, sizeof(int) * N, cudaMemcpyDeviceToHost);
-  cudaMemcpy(intValues.get(), dev_intValues, sizeof(int) * N, cudaMemcpyDeviceToHost);
+  cudaMemcpy(testGrid.get(), dev_testGrid, sizeof(int) * cellCount, cudaMemcpyDeviceToHost);
+  cudaMemcpy(testArray.get(), dev_testArray, sizeof(int) * cellCount, cudaMemcpyDeviceToHost);
   checkCUDAErrorWithLine("memcpy back failed!");
 
-  std::cout << "after unstable sort: " << std::endl;
-  for (int i = 0; i < N; i++) {
-    std::cout << "  key: " << intKeys[i];
-    std::cout << " value: " << intValues[i] << std::endl;
+  std::cout << "\nafter compute indeces " << std::endl;
+  for (int i = 0; i < cellCount; i++) {
+	  std::cout << "  gridIndex: " << testGrid[i];
+	  std::cout << "    arrayIndex: " << testArray[i] << std::endl;
   }
 
   // cleanup
-  cudaFree(dev_intKeys);
-  cudaFree(dev_intValues);
+  cudaFree(dev_testPos);
+  cudaFree(dev_testGrid);
+  cudaFree(dev_testArray);
   checkCUDAErrorWithLine("cudaFree failed!");
   return;
 }
